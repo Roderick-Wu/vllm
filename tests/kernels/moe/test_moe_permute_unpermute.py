@@ -440,6 +440,85 @@ def test_moe_permute_scratch_without_manager(monkeypatch) -> None:
     )
 
 
+@pytest.mark.parametrize("use_expert_map", [False, True])
+@pytest.mark.parametrize("use_scratch", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("routes", ["mixed", "all_negative", "all_out_of_range"])
+def test_moe_permute_invalid_routes(
+    use_expert_map: bool,
+    use_scratch: bool,
+    use_cuda_graph: bool,
+    routes: str,
+) -> None:
+    if not moe_permute_unpermute_supported():
+        pytest.skip("moe_permute_unpermute is not supported on this platform.")
+
+    hidden_states = torch.arange(5 * 16, dtype=torch.bfloat16, device="cuda").view(
+        5, 16
+    )
+    route_ids = [[0, 1], [-1, -1], [2, 4], [-1, 3], [5, -2]]
+    if routes == "all_negative":
+        route_ids = [[-1, -1]] * 5
+    elif routes == "all_out_of_range":
+        route_ids = [[4, 5]] * 5
+    topk_ids = torch.tensor(route_ids, device="cuda")
+    n_local_expert = 2 if use_expert_map else 4
+    expert_map = (
+        torch.tensor([0, 1, -1, -1], dtype=torch.int32, device="cuda")
+        if use_expert_map
+        else None
+    )
+    scratch = (
+        MoEPermuteScratch(
+            max_num_tokens=5,
+            topk=2,
+            num_experts=4,
+            num_local_experts=n_local_expert,
+            device=hidden_states.device,
+            hidden_size=16,
+            hidden_dtype=hidden_states.dtype,
+        )
+        if use_scratch
+        else None
+    )
+    counts = [sum(e in ids for ids in route_ids) for e in range(n_local_expert)]
+    valid_rows = sum(counts)
+    expected_offsets = torch.tensor([0, *counts], device="cuda").cumsum(0)
+    expected = torch.zeros_like(hidden_states)
+    for row, ids in enumerate(route_ids):
+        expected[row] = hidden_states[row] * sum(
+            0 <= expert < n_local_expert for expert in ids
+        )
+    weights = torch.ones(5, 2, device="cuda")
+    output = torch.empty_like(hidden_states)
+
+    def run():
+        permuted, _, offsets, inverse, _ = moe_permute(
+            hidden_states=hidden_states,
+            a1q_scale=None,
+            topk_ids=topk_ids,
+            n_expert=4,
+            n_local_expert=n_local_expert,
+            expert_map=expert_map,
+            scratch=scratch,
+        )
+        # Grouped GEMMs do not write padding rows. They must never be read
+        # during unpermute, even if a reused workspace contains NaNs.
+        permuted[valid_rows:].fill_(float("nan"))
+        moe_unpermute(output, permuted, weights, inverse, offsets)
+        return offsets
+
+    offsets = run()
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            offsets = run()
+        graph.replay()
+    torch.testing.assert_close(offsets, expected_offsets)
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(topk_ids, torch.tensor(route_ids, device="cuda"))
+
+
 def test_moe_permute_ignores_invalid_expert_ids_with_scratch() -> None:
     if not moe_permute_unpermute_supported():
         pytest.skip("moe_permute_unpermute is not supported on this platform.")

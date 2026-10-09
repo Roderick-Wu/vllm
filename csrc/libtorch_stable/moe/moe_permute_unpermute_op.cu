@@ -104,18 +104,17 @@ torch::stable::Tensor moe_sort_routing(
       torch::headeronly::ScalarType::Int, device, "sorted_row_idx");
 
   CubKeyValueSorter sorter{};
-  torch::stable::Tensor topk_ids_for_sort = topk_ids;
 
-  if (expert_map.has_value() || build_inverse) {
-    const int* expert_map_ptr =
-        expert_map.has_value() ? get_ptr<int>(expert_map.value()) : nullptr;
-    topk_ids_for_sort = maybe_allocate_tensor(
-        maybe_topk_ids_for_sort, topk_ids.sizes(),
-        torch::headeronly::ScalarType::Int, device, "topk_ids_for_sort");
-    torch::stable::copy_(topk_ids_for_sort, topk_ids);
-    preprocessTopkIdLauncher(get_ptr<int>(topk_ids_for_sort), n_token * topk,
-                             expert_map_ptr, n_expert, stream);
-  }
+  // Padding routes can be invalid even without expert parallelism (for
+  // example during CUDA graph warmup). Sort them after all local experts.
+  const int* expert_map_ptr =
+      expert_map.has_value() ? get_ptr<int>(expert_map.value()) : nullptr;
+  auto topk_ids_for_sort = maybe_allocate_tensor(
+      maybe_topk_ids_for_sort, topk_ids.sizes(),
+      torch::headeronly::ScalarType::Int, device, "topk_ids_for_sort");
+  torch::stable::copy_(topk_ids_for_sort, topk_ids);
+  preprocessTopkIdLauncher(get_ptr<int>(topk_ids_for_sort), n_token * topk,
+                           expert_map_ptr, n_expert, stream);
 
   sortAndScanExpert(
       get_ptr<const int>(topk_ids_for_sort), get_ptr<int>(token_expert_indices),
@@ -151,9 +150,7 @@ void moe_permute_impl(
   auto n_token = input.size(0);
   auto n_hidden = input.size(1);
   auto valid_num_ptr =
-      expert_map.has_value()
-          ? get_ptr<int64_t>(expert_first_token_offset) + n_local_expert
-          : nullptr;
+      get_ptr<int64_t>(expert_first_token_offset) + n_local_expert;
 
   MOE_DISPATCH(input.scalar_type(), [&] {
     expandInputRowsKernelLauncher<scalar_t>(

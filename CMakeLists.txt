@@ -1572,7 +1572,8 @@ endif()
 # provides only from GCC 13 onward.
 if (VLLM_GPU_LANG STREQUAL "CUDA"
     AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
-    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
+    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13"
+    AND NOT VLLM_ALLOW_OLD_GCC)
   message(FATAL_ERROR
     "GCC >= 13 is required to build vLLM with CUDA (found ${CMAKE_CXX_COMPILER_VERSION}). "
     "The DeepGEMM and DeepSelect dependencies use C++20 <format> in host code, "
